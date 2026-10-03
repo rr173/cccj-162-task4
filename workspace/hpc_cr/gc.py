@@ -161,6 +161,7 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
     material = {
         "policy": snapshot["policy"],
         "pins": snapshot["pins"],
+        "migration_holds": snapshot["migration_holds"],
         "min_retain_generation": snapshot["min_retain_generation"],
         "retain_generations": snapshot["retain_generations"],
         "retained_generations": snapshot["retained_generations"],
@@ -181,11 +182,18 @@ def build_snapshot(
     policy: str = POLICY_RECOVERABLE,
     min_retain_generation: int | None = None,
     retain_generations: dict[str, list[int]] | None = None,
+    migration_holds: dict[str, list[dict]] | None = None,
 ) -> dict[str, Any]:
-    """构造不可变计划快照 (不分配 plan_id/水位, 由 JobManager 完成)。"""
+    """构造不可变计划快照 (不分配 plan_id/水位, 由 JobManager 完成)。
+
+    ``migration_holds``: blob -> 临时保留描述 (活跃迁移任务); 被保留的
+    blob 不会进入候选, 保留集合本身进入引用指纹 —— 迁移创建/释放会推进
+    水位, 使旧计划在执行时被判 STALE。
+    """
     if policy not in (POLICY_RECOVERABLE, POLICY_ALL_COMPLETE,
                       POLICY_WATERMARK):
         raise ValueError(f"unknown gc policy: {policy}")
+    migration_holds = migration_holds or {}
     pins_norm = {
         job_id: sorted({int(g) for g in gens})
         for job_id, gens in sorted(pins.items())
@@ -211,8 +219,13 @@ def build_snapshot(
 
     candidates: list[dict[str, Any]] = []
     physical = dict(inventory)
+    held_count = 0
     for digest, size in sorted(physical.items()):
         if digest in retained_blob_reasons:
+            continue
+        if digest in migration_holds:
+            # 活跃迁移任务临时保留的载荷: 不参与回收, 任务终态即释放。
+            held_count += 1
             continue
         old_refs = historical_refs.get(digest, [])
         if old_refs:
@@ -243,15 +256,23 @@ def build_snapshot(
         job_id: {str(gen): reasons for gen, reasons in gen_map.items()}
         for job_id, gen_map in retained.items()
     }
+    # 只保留影响候选集合的稳定字段 (任务状态/计数不参与指纹)。
+    holds_payload = {
+        digest: sorted(
+            {h.get("migration_id") for h in holds if h.get("migration_id")})
+        for digest, holds in sorted(migration_holds.items())
+    }
     snapshot = {
         "policy": policy,
         "pins": pins_norm,
+        "migration_holds": holds_payload,
         "min_retain_generation": min_retain_generation,
         "retain_generations": retain_generations,
         "retained_generations": retain_payload,
         "generation_explanations": explanations,
         "references": ref_dicts,
         "retained_blob_count": len(retained_blob_reasons),
+        "migration_held_blob_count": held_count,
         "physical_blob_count": len(physical),
         "candidates": candidates,
         "estimated_reclaim_bytes": sum(c["size"] for c in candidates),
@@ -284,6 +305,7 @@ def plan_public(plan: dict[str, Any]) -> dict[str, Any]:
         "generation_explanations": plan.get("generation_explanations", {}),
         "estimated_reclaim_items": plan.get("estimated_reclaim_items", 0),
         "estimated_reclaim_bytes": plan.get("estimated_reclaim_bytes", 0),
+        "migration_held_blob_count": plan.get("migration_held_blob_count", 0),
         "deleted_items": plan.get("deleted_items", 0),
         "deleted_bytes": plan.get("deleted_bytes", 0),
         "skipped_items": plan.get("skipped_items", 0),

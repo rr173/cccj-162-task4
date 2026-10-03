@@ -351,3 +351,41 @@ class CheckpointManager:
             cp.completed_ts = completed_ts
             if manifest is not None:
                 cp.manifest = manifest
+
+    def import_complete(
+        self,
+        *,
+        epoch: int,
+        generation: int,
+        world_size: int,
+        shards_per_rank: int,
+        processes: list[tuple[int, str]],
+        created_ts: float,
+        completed_ts: float,
+        manifest: dict,
+    ) -> Checkpoint:
+        """接收端按迁移发布清单构建一个已 COMPLETE 的检查点骨架。
+
+        与 open() 不同: 导入代际从未在本集群经历抢占, 直接以冻结清单的
+        COMPLETE 形态存在; 分片由调用方在 *全量内容校验通过后* 用
+        restore_shard() 回填。调用方必须先保证不存在同代际检查点。
+        """
+        with self._lock:
+            if generation in self._cps:
+                raise Conflict(
+                    f"generation {generation} already exists in job "
+                    f"{self.job_id}; adopt is only allowed once")
+            cp = Checkpoint(
+                job_id=self.job_id,
+                epoch=epoch,
+                generation=generation,
+                world_size=world_size,
+                shards_per_rank=shards_per_rank,
+                processes=tuple(sorted(processes)),
+                created_ts=created_ts,
+            )
+            cp.state = COMPLETE
+            cp.completed_ts = completed_ts
+            cp.manifest = manifest
+            self._cps[generation] = cp
+            return cp

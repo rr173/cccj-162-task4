@@ -150,6 +150,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:3] == ["api", "gc", "plans"]:
                 return self._handle(
                     lambda pid=parts[3]: self.mgr.get_gc_plan(pid))
+            if parts == ["api", "migration-destinations"]:
+                return self._handle(
+                    lambda: {"destinations": self.mgr.list_destinations()})
+            if parts == ["api", "migrations"]:
+                query = urlsplit(self.path).query
+                params = {}
+                if query:
+                    from urllib.parse import parse_qs
+                    params = {k: v[0] for k, v in parse_qs(query).items()}
+                return self._handle(lambda: {"migrations": self.mgr.list_migrations(
+                    params.get("job_id"))})
+            if len(parts) == 3 and parts[:2] == ["api", "migrations"]:
+                return self._handle(
+                    lambda mid=parts[2]: self.mgr.get_migration(mid))
+            if parts == ["api", "published-generations"]:
+                from urllib.parse import parse_qs
+                q = {k: v[0] for k, v in
+                     parse_qs(urlsplit(self.path).query).items()}
+                return self._handle(lambda: {"published":
+                    self.mgr.list_published_generations(
+                        destination_id=q.get("destination_id"),
+                        source_job_id=q.get("job_id"))})
             if len(parts) == 5 and parts[:2] == ["api", "jobs"] \
                     and parts[3:] == ["gc", "pins"]:
                 return self._handle(lambda jid=parts[2]:
@@ -179,6 +201,48 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self.headers.get("X-Lease-Token")
 
         try:
+            if parts == ["api", "migration-destinations"]:
+                return self._handle(lambda: self.mgr.register_destination(
+                    body["destination_id"],
+                    data_dir=body.get("data_dir"),
+                    reason=body.get("reason", "cluster_relocation"),
+                ), status=201)
+            if parts == ["api", "migrations"]:
+                return self._handle(lambda: self.mgr.create_migration(
+                    body["job_id"],
+                    generation=int(body["generation"]),
+                    destination_id=body["destination_id"],
+                    migration_id=body.get("migration_id"),
+                    reason=body.get("reason", "cluster_relocation"),
+                ), status=201)
+            if len(parts) == 3 and parts[:2] == ["api", "migrations"]:
+                mid = parts[2]
+                action = body.get("action", "transfer")
+                if action == "transfer":
+                    return self._handle(lambda: self.mgr.transfer_migration(
+                        mid,
+                        object_ids=body.get("object_ids"),
+                        limit=_optional_int(body.get("limit")),
+                        auto_finalize=bool(body.get("auto_finalize", True)),
+                    ))
+                if action == "finalize":
+                    return self._handle(
+                        lambda: self.mgr.finalize_migration(mid))
+                if action == "cancel":
+                    return self._handle(lambda: self.mgr.cancel_migration(
+                        mid, reason=body.get("reason", "cancelled_by_user")))
+                self._send_json(404, {"error": "not_found",
+                                      "message": self.path})
+                return
+            if parts == ["api", "adoptions"]:
+                return self._handle(lambda: self.mgr.adopt_generation(
+                    manifest=body.get("manifest"),
+                    migration_id=body.get("migration_id"),
+                    destination_id=body.get("destination_id"),
+                    target_job_id=body.get("target_job_id"),
+                    name=body.get("name"),
+                    create_job=bool(body.get("create_job", True)),
+                ), status=201)
             if parts == ["api", "gc", "plans"]:
                 return self._handle(lambda: self.mgr.create_gc_plan(
                     policy=body.get("policy", "recoverable"),

@@ -34,6 +34,11 @@ _STATE_COLORS = {
     "DELETED": "#0a7d2c",
     "SKIPPED": "#666",
     "FAILED": "#b00020",
+    "TRANSFERRED": "#0a7d2c",
+    "REUSED": "#1a4fb3",
+    "ITEM_FAILED": "#b00020",
+    "PUBLISHED": "#0a7d2c",
+    "CANCELLED": "#666",
 }
 
 
@@ -92,6 +97,89 @@ def render_gc_section(gc_plans: list[dict], job_id: str) -> str:
     <a href="/api/jobs/%s/gc/pins">本作业代际锁</a></small></p>
     %s
     """ % (_h(job_id), "".join(blocks))
+
+
+def render_migration_section(data: dict) -> str:
+    migrations = data.get("migrations") or []
+    published = data.get("published_generations") or []
+    held = data.get("migration_holds") or {}
+    if not migrations and not published:
+        return """
+        <h2>检查点迁移 (跨内容存储, 可恢复)</h2>
+        <p><small>暂无迁移任务 · <code>POST /api/migration-destinations</code>
+        注册接收端, <code>POST /api/migrations</code> 创建任务</small></p>
+        """
+    blocks = []
+    for m in migrations[:10]:
+        total = max(m["total_items"], 1)
+        done = m["done_items"]
+        pct = int(100 * done / total)
+        rows = "".join(
+            f"<tr><td><code>{_h(o['object_id'])}</code></td>"
+            f"<td>{_h(o['kind'])}</td>"
+            f"<td><code>{_h(o['blob'][:16])}</code></td>"
+            f"<td>{o['size']}</td>"
+            f"<td>{_badge(o['status'].replace('ITEM_FAILED', 'ITEM_FAILED'))}</td>"
+            f"<td>{o['attempts']}</td>"
+            f"<td><small>{_h(o.get('last_error') or '')}</small></td></tr>"
+            for o in m.get("objects", [])[:100]
+        )
+        state_note = ""
+        if m["state"] == "FAILED":
+            state_note = (f"<b>失败原因: {_h(m.get('reason'))}</b> · "
+                          f"<small>{_h(m.get('error'))}</small>")
+        elif m["state"] == "CANCELLED":
+            state_note = f"取消原因: {_h(m.get('reason'))}"
+        elif m["state"] == "PUBLISHED":
+            state_note = "全部内容校验通过, 可恢复代际已一次性发布"
+        blocks.append(f"""
+        <h3>迁移 <code>{_h(m['migration_id'])}</code> {_badge(m['state'])}
+        <small>→ {_h(m['destination_id'])}</small></h3>
+        <p><small>源 gen{m['source_generation']} ·
+        清单摘要 <code>{_h((m['manifest_digest'] or '')[:16])}</code> ·
+        创建 {_ts(m['created_ts'])} · 开始 {_ts(m['started_ts'])} ·
+        终态 {_ts(m['finished_ts'])}</small></p>
+        <table border="1" cellpadding="6">
+          <tr><th>计划总量</th><th>计划字节</th><th>已传输项</th>
+          <th>复用项</th><th>失败项</th><th>完成</th></tr>
+          <tr><td>{m['total_items']}</td><td>{m['total_bytes']}</td>
+          <td>{m['transferred_items']} ({m['transferred_bytes']}B)</td>
+          <td>{m['reused_items']} ({m['reused_bytes']}B)</td>
+          <td>{m['failed_items']}</td><td>{done}/{m['total_items']}</td></tr>
+        </table>
+        <div style="background:#eee;width:360px;height:14px;border-radius:7px">
+          <div style="background:#0a7d2c;width:{pct}%;height:14px;border-radius:7px"></div>
+        </div>
+        <p>{state_note}</p>
+        <details><summary>对象明细 (前 100 项)</summary>
+        <table border="1" cellpadding="6"><tr><th>对象</th><th>类型</th>
+        <th>摘要</th><th>大小</th><th>状态</th><th>尝试</th><th>错误</th></tr>
+        {rows}</table></details>""")
+    pub_rows = "".join(
+        f"<tr><td><code>{_h(p['migration_id'])}</code></td>"
+        f"<td>{_h(p['destination_id'])}</td>"
+        f"<td>gen{p['source_generation']}</td>"
+        f"<td>{p['total_items']}</td>"
+        f"<td>{p['transferred_items']}</td><td>{p['reused_items']}</td>"
+        f"<td><code>{_h(p['manifest_digest'][:16])}</code></td>"
+        f"<td>{_ts(p['published_ts'])}</td></tr>"
+        for p in published
+    )
+    pub_html = ""
+    if pub_rows:
+        pub_html = f"""
+        <h3>已发布可恢复代际 (接收端可 adopt)</h3>
+        <table border="1" cellpadding="6"><tr><th>迁移</th><th>接收端</th>
+        <th>代际</th><th>总项</th><th>传输</th><th>复用</th>
+        <th>清单摘要</th><th>发布时间</th></tr>{pub_rows}</table>"""
+    return f"""
+    <h2>检查点迁移 (冻结清单 → 临时保留 → 传输/复用 → 全量校验 → 发布)</h2>
+    <p><small>当前临时保留 blob: {len(held)} ·
+    <a href="/api/migrations?job_id={_h(data['job']['job_id'])}">迁移任务 JSON</a>
+    · <a href="/api/published-generations?job_id={_h(data['job']['job_id'])}">
+    已发布代际 JSON</a></small></p>
+    {''.join(blocks)}
+    {pub_html}"""
 
 
 def render_progress_page(data: dict) -> str:
@@ -212,6 +300,7 @@ def render_progress_page(data: dict) -> str:
 {ep_html}
 <h2>检查点分片矩阵</h2>
 {''.join(matrices) or '<p>尚无检查点</p>'}
+{render_migration_section(data)}
 {render_gc_section(data.get('gc_plans') or [], job['job_id'])}
 <h2>节点</h2>
 <table border="1" cellpadding="6"><tr><th>节点</th><th>状态</th>

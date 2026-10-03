@@ -18,6 +18,7 @@
 | 9 | **结果提交授权失败统一处理**：缺失/伪造/超期/撤销/跨作业/旧代际凭证一律返回稳定错误（固定状态码+`reason`+固定消息，不回显凭证），并写入一条**顺序化安全事件**（全局单调 seq，不含凭证原文）；授权在写入前终止，重复并发请求不增加结果条目 | `leases.py::authorize`、`jobs.py::_deny` |
 | 10 | **事件溯源持久化**：所有状态变更（含安全事件、输出条目、恢复报告、GC 计划/删除）顺序追加到 `data_dir/journal.jsonl`，blob 原子落盘；服务重启按 seq 重放重建，页面与验证报告仍可查询，旧令牌仍被栅栏，同密钥重新派生 | `persistence.py`、`jobs.py::_replay` |
 | 11 | **可审计空间回收**：GC 先生成带 journal 水位、保留代际、引用指纹、预计释放量和候选明细的计划；可锁定/解锁代际；计划生成后引用关系变化则拒绝执行；上传/恢复/回收共享全局引用临界区，绝不删除仍可访问数据；RUNNING 计划崩溃重启后可继续，每个删除动作和跳过/恢复原因均可查询 | `gc.py`、`jobs.py::create_gc_plan/execute_gc_plan` |
+| 12 | **可恢复检查点迁移**：导出端冻结对象清单（逐项 sha256+清单摘要，源载荷逐个重读重算）并临时保留涉及 blob；接收端按摘要复用已有对象、缺失才传输，每项两端重算哈希；全部内容校验通过后才一次性原子发布可恢复代际；传输中断、重复请求、服务重启后继续同一任务；清单变化或摘要错误绝不产生可恢复代际；取消/失败即释放临时保留且不阻碍正常 GC；接收端凭发布清单 adopt 后可同代际恢复 | `migration.py`、`jobs.py::create_migration/transfer_migration/finalize_migration/adopt_generation` |
 
 ## 状态机
 
@@ -38,7 +39,7 @@
 
 ```bash
 # 测试
-python3 -m unittest discover -s tests -v        # 54 个测试, 含 GC/并发竞争与重启持久化
+python3 -m unittest discover -s tests -v        # 77 个测试, 含 GC/迁移/并发竞争与重启持久化
 
 # 端到端演示 (打印恢复验证报告 Markdown)
 python3 demo.py
@@ -80,6 +81,15 @@ python3 -m hpc_cr --data-dir ./hpc-data
 | `POST /api/gc/plans/{id}` `{action:"execute"}` | 按计划执行；水位推进、引用变化或物理 blob 集合变化时返回 409 并把计划标记 `STALE` |
 | `GET  /api/gc/plans` / `GET /api/gc/plans/{id}` | 全部计划 / 单计划查询：预计/实际删除项、字节、跳过和崩溃恢复原因、最终状态 |
 | `GET  /api/jobs/{id}/gc/pins` | 查询作业已锁定代际 |
+| `POST /api/migration-destinations` | 注册接收端内容存储（`destination_id`、`data_dir`），磁盘后端重启自动重建 |
+| `POST /api/migrations` | 创建迁移任务（`job_id`、`generation`、`destination_id`）：导出端冻结清单+源端重校验+临时保留；同 (作业,代际,接收端) 活跃任务重复请求幂等 |
+| `POST /api/migrations/{id}` `{action:"transfer"}` | 续传/传输：`object_ids` 指定对象、`limit` 限本次项数、`auto_finalize`（默认 true 全部完成即发布）；按摘要复用，每项两端重算哈希，中断/重复/重启续传 |
+| `POST /api/migrations/{id}` `{action:"finalize"}` | 全量闸门：清单重检+全部对象目标端重读重算，通过才一次性发布可恢复代际；否则 FAILED 不发布 |
+| `POST /api/migrations/{id}` `{action:"cancel"}` | 取消活跃任务：不发布代际，立即释放临时保留（终态幂等） |
+| `GET  /api/migrations` / `GET /api/migrations/{id}` | 全部/单个迁移任务：计划总量/字节、已传输项、复用项、失败项、逐项状态、最终状态与原因 |
+| `GET  /api/published-generations` | 已发布可恢复代际目录（可按 `destination_id`/`job_id` 过滤），含 adopt 所需完整清单 |
+| `POST /api/adoptions` | 接收端落地：`manifest`（跨集群）或本地 `migration_id` + `destination_id`；全量内容校验通过才生成 RELEASED 作业的 COMPLETE 代际（可 `restore`），否则拒绝 |
+| `GET  /api/migration-destinations` | 已注册接收端存储及其 blob 统计 |
 | `GET  /api/jobs/{id}/progress.json` | 进度页聚合数据（节点/进程/分片矩阵/输出/审计） |
 | `GET  /api/jobs/{id}/checkpoints` | 全部代际检查点 |
 | `GET  /api/jobs/{id}/outputs` | 输出条目（按代际隔离） |
@@ -146,6 +156,41 @@ python3 -m hpc_cr --data-dir ./hpc-data
   "blob 已落盘但元数据引用尚未建立" 的中间态；正在执行的计划会阻止生成
   新计划，COMPLETED 计划重复执行幂等。
 
+## 检查点迁移语义 (跨内容存储, 可恢复)
+
+集群下线或作业搬迁时, 把一个已 COMPLETE 的检查点及其同代际输出迁到另一套
+内容存储。迁移是显式的 **注册接收端 → 冻结清单 → 传输/复用 → 全量校验 →
+一次性发布** 流程:
+
+- **冻结清单 + 临时保留**: 创建任务时在全局引用临界区内枚举该代际全部分片
+  与输出, 记录逐项 `sha256/大小` 与整体 *清单摘要*; 同时对源载荷逐个从
+  CAS 重读重算哈希, 缺片/损坏直接拒绝导出 (不建任务、不加保留)。任务涉及
+  的 blob 在终态前以 migration hold 临时保留。
+- **按摘要复用, 缺失才传输**: 接收端已有同摘要且重算完好的对象计为
+  `REUSED`; 缺失对象实际复制并在两端各重算一次哈希。每个对象有独立
+  `PLANNED/TRANSFERRED/REUSED/ITEM_FAILED` 状态, `transfer` 可用
+  `object_ids`/`limit` 分批推进; 传输中断、重复请求、服务重启后继续同一
+  任务, 已完成对象跳过。
+- **只有全量校验通过才一次性发布**: `finalize`(或全部完成时自动) 重检清单
+  摘要并对 *全部* 对象在目标端重读重算哈希。冻结后源代际产生新输出导致
+  清单变化 (`manifest_changed`)、任一对象摘要不符
+  (`destination_digest_mismatch`)、仍有未完成项 (`incomplete_objects`)
+  一律把任务置为 `FAILED`, **绝不写入发布目录**。
+- **取消/失败释放临时保留, 不阻碍空间回收**: hold 是 blob 级临时保留,
+  迁移创建/发布/失败/取消都推进 GC 引用水位; 活跃迁移期间的 GC 计划把
+  held blob 排除为候选, 迁移终态后该 blob 立即恢复正常回收资格。已复制到
+  接收端的孤儿副本由接收端 GC 正常回收。
+- **发布目录与接收端 adopt**: 全部校验通过后原子写入 published catalog
+  (含完整冻结清单与复用/传输统计); 接收集群 `POST /api/adoptions` 凭清单
+  在本地再次全量校验, 通过才生成 RELEASED 作业的 COMPLETE 检查点和输出,
+  随后即可用既有的同代际 `restore()` 恢复 (新输出租约/输入位点表等语义不
+  变)。adopt 与发布事件均持久化, 接收端重启后仍可恢复。
+
+任务状态: `PLANNED → TRANSFERRING → PUBLISHED`, 任意活跃态可 `CANCELLED`;
+清单变化/摘要错误/终检不过为终态 `FAILED` (失败原因稳定可查)。作业进度页
+展示每个任务的计划总量、已传输项、复用项、失败项、进度条、逐项明细、最终
+状态与原因, 以及已发布可恢复代际表。
+
 ## 并发正确性
 
 - 每作业一把 `RLock`；另有全局引用锁和 GC 状态锁，固定顺序为
@@ -160,6 +205,14 @@ python3 -m hpc_cr --data-dir ./hpc-data
   - 代际 pin 与代际水位；计划后恢复/输出/pin 变化 → STALE 且拒绝执行；
   - 上传、恢复与 GC 并发时仍可访问的数据绝不被删除；
   - “物理删除已成功但事件未落盘”的崩溃重启续跑与查询接口/作业页面展示。
+- 测试 `tests/test_migration.py` 覆盖：
+  - 仅 COMPLETE 可导出、未知接收端/代际拒绝、冻结即源端重校验；
+  - 按摘要复用、分片+输出整体迁移、接收端 adopt 后同代际恢复与重启持久化；
+  - 分批传输/中断/重复请求/服务重启后继续同一任务，最终只发布一次；
+  - 冻结后清单变化、目标端损坏“同键”对象、终检摘要不符 → FAILED 且无发布；
+  - 取消/失败释放临时保留；活跃迁移 hold 使旧 GC 计划 STALE、新计划排除
+    held blob，终态后源 blob 恢复可回收而接收端副本完好；
+  - 8 线程并发续跑同一任务计数一致、恰好发布一次；HTTP API 与作业页面进度。
 - 测试 `tests/test_authz_security.py` 覆盖：
   - 缺失/伪造/错类型/撤销/超期/跨作业/旧代际凭证的稳定错误分类与无回显；
   - 每次拒绝一条顺序化安全事件（seq 唯一递增、无凭证原文）；
@@ -177,11 +230,12 @@ hpc_cr/
   storage.py      # 内容寻址 blob 存储 (内存/磁盘) + 输出去重日志
   checkpoints.py  # 分片、检查点状态机、全量重校验提交、重放回填
   leases.py       # 输出租约、代际栅栏、授权失败稳定归类
+  migration.py    # 迁移冻结清单/摘要、任务与对象视图、发布代际记录
   gc.py           # GC 引用快照、保留代际、候选与计划视图
-  jobs.py         # Job/JobManager 聚合根、恢复验证报告、GC 编排、事件溯源/重放
+  jobs.py         # Job/JobManager 聚合根、恢复报告、GC/迁移编排、事件溯源/重放
   api.py          # stdlib ThreadingHTTPServer JSON API
-  ui.py           # 节点进度页面 HTML 渲染 (含安全事件与 GC 计划表)
-tests/            # 54 个单元/并发/HTTP/GC/重启持久化测试
+  ui.py           # 节点进度页面 HTML 渲染 (含安全事件、GC 计划与迁移进度表)
+tests/            # 77 个单元/并发/HTTP/GC/迁移/重启持久化测试
 demo.py           # 端到端场景脚本 (可选 --data-dir 持久化)
 ```
 

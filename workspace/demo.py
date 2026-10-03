@@ -133,6 +133,27 @@ def run_demo(data_dir: str | None = None) -> tuple[JobManager, str, str, str]:
                        for o in mgr.list_outputs("climate-7")])
     print("审计事件:", [a["event"] for a in job.audit])
 
+    banner("7) 集群搬迁: 检查点+输出迁移到另一套内容存储 (可恢复代际)")
+    import os
+    import tempfile
+    dst_dir = os.path.join(data_dir or tempfile.gettempdir(),
+                           "cluster-b-storage")
+    os.makedirs(dst_dir, exist_ok=True)
+    mgr.register_destination("cluster-b", data_dir=dst_dir)
+    mig = mgr.create_migration(
+        "climate-7", generation=1, destination_id="cluster-b")
+    print(f"任务 {mig['migration_id']} 已冻结清单: "
+          f"{mig['total_items']} 个对象, {mig['total_bytes']} 字节")
+    progress = mgr.transfer_migration(mig["migration_id"])
+    print(f"传输完成: 状态 {progress['state']} · 已传输 "
+          f"{progress['transferred_items']} · 复用 {progress['reused_items']} "
+          f"· 失败 {progress['failed_items']}")
+    pub = mgr.list_published_generations("cluster-b")[0]
+    print("已一次性发布可恢复代际, 清单摘要:",
+          pub["manifest_digest"][:16])
+    print("临时保留已释放, 当前保留 blob 数:",
+          len(mgr.migration_holds()))
+
     return mgr, "climate-7", token, new_lease
 
 

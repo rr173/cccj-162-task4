@@ -60,6 +60,9 @@ class ContentStore:
         path = os.path.join(self._blob_dir, digest)
         if os.path.exists(path):
             return
+        self._write_durable_at(path, data)
+
+    def _write_durable_at(self, path: str, data: bytes) -> None:
         fd, tmp = tempfile.mkstemp(dir=self._blob_dir, prefix=".tmp-")
         try:
             with os.fdopen(fd, "wb") as fp:
@@ -73,6 +76,23 @@ class ContentStore:
             except OSError:
                 pass
             raise
+
+    def rewrite(self, digest: str, data: bytes) -> None:
+        """强制以 ``data`` 重写 blob (修复 bit-rot/损坏副本)。
+
+        正常写入走 put() 的内容寻址去重; 损坏的"同键"对象需要物理替换,
+        原子 rename 保证校验路径绝不会读到半个文件。
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValidationError("blob payload must be bytes")
+        if sha256_hex(data) != digest:
+            raise ValidationError(
+                "rewrite refused: payload does not match content digest")
+        with self._lock:
+            self._blobs[digest] = bytes(data)
+            if self._disk:
+                self._write_durable_at(
+                    os.path.join(self._blob_dir, digest), bytes(data))
 
     def _load(self, digest: str) -> bytes | None:
         cached = self._blobs.get(digest)
