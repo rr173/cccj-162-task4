@@ -133,6 +133,30 @@ def run_demo(data_dir: str | None = None) -> tuple[JobManager, str, str, str]:
                        for o in mgr.list_outputs("climate-7")])
     print("审计事件:", [a["event"] for a in job.audit])
 
+    banner("7) 集群搬迁: gen1 检查点+输出迁移到另一套内容存储")
+    import os
+    from hpc_cr.storage import ContentStore
+    dest_dir = os.path.join(data_dir, "archive-blobs") if data_dir else None
+    mgr.register_destination(
+        "archive", ContentStore(dest_dir) if dest_dir else ContentStore())
+    task = mgr.create_migration("climate-7", generation=1,
+                                destination="archive", task_id="mig-demo")
+    print(f"迁移任务 {task['task_id']}: 冻结清单 {task['planned_items']} 项 / "
+          f"{task['planned_bytes']} 字节, 摘要 {task['manifest_digest'][:16]}…")
+    # 分块传输 (演示断点续传): 先传 3 项, 再继续同一任务
+    part = mgr.run_migration(task["task_id"], max_items=3)
+    print(f"第一批: 已传输 {part['transferred_items']}, 复用 "
+          f"{part['reused_items']}, 待传 {part['pending_items']} "
+          f"({part['state']})")
+    done = mgr.run_migration(task["task_id"])
+    print(f"继续同一任务 -> {done['state']}: 已传输 "
+          f"{done['transferred_items']}, 复用 {done['reused_items']}, "
+          f"失败 {done['failed_items']}")
+    published = mgr.published_generations("climate-7")
+    print("已发布可恢复代际:", [
+        (r["generation"], r["destination"], r["manifest_digest"][:12])
+        for r in published])
+
     return mgr, "climate-7", token, new_lease
 
 

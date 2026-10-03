@@ -43,17 +43,27 @@ def _optional_int(value):
 
 
 def build_default_manager(
-    secret: str | None = None, data_dir: str | None = None
+    secret: str | None = None, data_dir: str | None = None,
+    destinations: dict | None = None,
 ) -> JobManager:
     """构造默认管理器。
 
     secret 缺省时: 持久化模式 (data_dir 给定) 从环境变量/密钥文件加载,
     保证重启后 HMAC 密钥一致、旧令牌仍可验证; 纯内存模式用固定演示密钥。
+    destinations 是迁移目标内容存储配置: 名字 -> ContentStore 或持久化
+    目录路径 (字符串时自动创建持久化 ContentStore)。属于配置项, 重启后
+    需以同样配置重新提供。
     """
     if secret is None:
         secret = (load_or_create_secret(data_dir)
                   if data_dir is not None else "demo-scheduler-secret")
-    return JobManager(Scheduler(Signer(secret)), data_dir=data_dir)
+    from .storage import ContentStore
+    stores = {
+        name: (ContentStore(path) if isinstance(path, str) else path)
+        for name, path in (destinations or {}).items()
+    }
+    return JobManager(Scheduler(Signer(secret)), data_dir=data_dir,
+                      destinations=stores)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -147,6 +157,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parts == ["api", "gc", "plans"]:
                 return self._handle(
                     lambda: {"plans": self.mgr.list_gc_plans()})
+            if parts == ["api", "migrations"]:
+                return self._handle(
+                    lambda: {"migrations": self.mgr.list_migrations(),
+                             "destinations": self.mgr.list_destinations()})
+            if len(parts) == 3 and parts[:2] == ["api", "migrations"]:
+                return self._handle(
+                    lambda tid=parts[2]: self.mgr.get_migration(tid))
             if len(parts) == 4 and parts[:3] == ["api", "gc", "plans"]:
                 return self._handle(
                     lambda pid=parts[3]: self.mgr.get_gc_plan(pid))
@@ -154,6 +171,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     and parts[3:] == ["gc", "pins"]:
                 return self._handle(lambda jid=parts[2]:
                                     self.mgr.generation_pins(jid))
+            if len(parts) == 4 and parts[:2] == ["api", "jobs"] \
+                    and parts[3] == "migrations":
+                return self._handle(lambda jid=parts[2]: {
+                    "migrations": self.mgr.list_migrations(jid),
+                    "published": self.mgr.published_generations(jid)})
             if parts[:1] == ["ui"] and len(parts) == 3 and parts[1] == "jobs":
                 data = self.mgr.progress_page_data(parts[2])
                 return self._html(
@@ -188,6 +210,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                     include_pins=bool(body.get("include_pins", True)),
                     plan_id=body.get("plan_id"),
                 ), status=201)
+            if parts == ["api", "migrations"]:
+                return self._handle(lambda: self.mgr.create_migration(
+                    body["job_id"],
+                    generation=int(body["generation"]),
+                    destination=body["destination"],
+                    task_id=body.get("task_id"),
+                ), status=201)
+            if len(parts) == 3 and parts[:2] == ["api", "migrations"]:
+                tid = parts[2]
+                action = body.get("action", "run")
+                if action == "run":
+                    return self._handle(lambda: self.mgr.run_migration(
+                        tid,
+                        max_items=_optional_int(body.get("max_items"))))
+                if action == "cancel":
+                    return self._handle(lambda: self.mgr.cancel_migration(
+                        tid, reason=body.get("reason", "operator_cancel")))
+                self._send_json(404, {"error": "not_found",
+                                      "message": self.path})
+                return
             if len(parts) == 4 and parts[:3] == ["api", "gc", "plans"]:
                 pid = parts[3]
                 action = body.get("action", "execute")
@@ -318,8 +360,10 @@ def build_server(
     port: int = 8080,
     verbose: bool = False,
     data_dir: str | None = None,
+    destinations: dict | None = None,
 ) -> ThreadingHTTPServer:
-    manager = manager or build_default_manager(data_dir=data_dir)
+    manager = manager or build_default_manager(data_dir=data_dir,
+                                               destinations=destinations)
 
     class _Handler(ApiHandler):
         pass
@@ -333,14 +377,16 @@ def build_server(
 
 
 def serve_forever(host: str = "127.0.0.1", port: int = 8080,
-                  verbose: bool = False,
-                  data_dir: str | None = None) -> None:  # pragma: no cover
+                  verbose: bool = False, data_dir: str | None = None,
+                  destinations: dict | None = None) -> None:  # pragma: no cover
     server = build_server(host=host, port=port, verbose=verbose,
-                          data_dir=data_dir)
+                          data_dir=data_dir, destinations=destinations)
     print(f"HPC checkpoint service on http://{host}:{port}  "
           f"(UI: http://{host}:{port}/ui/jobs/<job_id>)")
     if data_dir:
         print(f"persistent data directory: {data_dir}")
+    for name in server.manager.list_destinations():
+        print(f"migration destination registered: {name}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

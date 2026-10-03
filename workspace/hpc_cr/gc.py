@@ -164,6 +164,7 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
         "min_retain_generation": snapshot["min_retain_generation"],
         "retain_generations": snapshot["retain_generations"],
         "retained_generations": snapshot["retained_generations"],
+        "migration_holds": snapshot["migration_holds"],
         "references": sorted(
             snapshot["references"],
             key=lambda r: (r["job_id"], r["kind"], r["generation"],
@@ -181,8 +182,14 @@ def build_snapshot(
     policy: str = POLICY_RECOVERABLE,
     min_retain_generation: int | None = None,
     retain_generations: dict[str, list[int]] | None = None,
+    migration_holds: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """构造不可变计划快照 (不分配 plan_id/水位, 由 JobManager 完成)。"""
+    """构造不可变计划快照 (不分配 plan_id/水位, 由 JobManager 完成)。
+
+    ``migration_holds`` 是迁移任务的临时保留 (blob -> 保留原因列表):
+    持有期间这些 blob 一律视为 retained, 且进入引用指纹 —— 计划生成后
+    保留集合的任何变化都会使计划过期。
+    """
     if policy not in (POLICY_RECOVERABLE, POLICY_ALL_COMPLETE,
                       POLICY_WATERMARK):
         raise ValueError(f"unknown gc policy: {policy}")
@@ -192,6 +199,11 @@ def build_snapshot(
     }
     pins_norm = {k: v for k, v in pins_norm.items() if v}
     retain_generations = retain_generations or {}
+    holds_norm = {
+        blob: sorted(reasons)
+        for blob, reasons in sorted((migration_holds or {}).items())
+        if reasons
+    }
     retained, explanations = compute_retention(
         jobs, pins=pins_norm, policy=policy,
         min_retain_generation=min_retain_generation,
@@ -208,6 +220,14 @@ def build_snapshot(
         is_retained = ref["generation"] in retained.get(ref["job_id"], {})
         target = retained_blob_reasons if is_retained else historical_refs
         target.setdefault(ref["blob"], []).append(ref)
+    # 迁移临时保留: 无论引用关系如何, 持有期间一律 retained。
+    for blob, reasons in holds_norm.items():
+        retained_blob_reasons.setdefault(blob, [])
+        for reason in reasons:
+            retained_blob_reasons[blob].append({
+                "blob": blob, "kind": "migration_hold",
+                "job_id": None, "generation": None, "ref_id": reason,
+            })
 
     candidates: list[dict[str, Any]] = []
     physical = dict(inventory)
@@ -249,6 +269,7 @@ def build_snapshot(
         "min_retain_generation": min_retain_generation,
         "retain_generations": retain_generations,
         "retained_generations": retain_payload,
+        "migration_holds": holds_norm,
         "generation_explanations": explanations,
         "references": ref_dicts,
         "retained_blob_count": len(retained_blob_reasons),
@@ -281,6 +302,7 @@ def plan_public(plan: dict[str, Any]) -> dict[str, Any]:
         "min_retain_generation": plan.get("min_retain_generation"),
         "retain_generations": plan.get("retain_generations"),
         "retained_generations": plan.get("retained_generations", {}),
+        "migration_holds": plan.get("migration_holds", {}),
         "generation_explanations": plan.get("generation_explanations", {}),
         "estimated_reclaim_items": plan.get("estimated_reclaim_items", 0),
         "estimated_reclaim_bytes": plan.get("estimated_reclaim_bytes", 0),

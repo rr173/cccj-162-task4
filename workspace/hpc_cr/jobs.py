@@ -46,7 +46,22 @@ from .gc import (
     plan_public,
 )
 from .leases import LeaseManager
+from .migration import (
+    ACTIVE_STATES as MIG_ACTIVE,
+    CANCELLED as MIG_CANCELLED,
+    FAILED as MIG_FAILED,
+    ITEM_PENDING as MIG_ITEM_PENDING,
+    PLANNED as MIG_PLANNED,
+    PUBLISHED as MIG_PUBLISHED,
+    TRANSFERRING as MIG_TRANSFERRING,
+    build_manifest_items,
+    manifest_digest,
+    new_item,
+    new_task_id,
+    task_public,
+)
 from .persistence import Journal
+from .security import sha256_hex
 from .storage import ContentStore, OutputLog
 
 # 作业状态
@@ -74,6 +89,19 @@ GC_PLAN_STALE = "gc_plan_stale"
 GC_GENERATION_PIN = "gc_generation_pin"
 GC_GENERATION_UNPIN = "gc_generation_unpin"
 
+# 迁移任务事件 (归属具体作业; 生命周期事件会改变 GC 保留集合)
+MIGRATION_CREATED = "migration_created"
+MIGRATION_ITEM_TRANSFERRED = "migration_item_transferred"
+MIGRATION_ITEM_FAILED = "migration_item_failed"
+MIGRATION_PUBLISHED = "migration_published"
+MIGRATION_FAILED = "migration_failed"
+MIGRATION_CANCELLED = "migration_cancelled"
+
+_MIGRATION_EVENTS = frozenset({
+    MIGRATION_CREATED, MIGRATION_ITEM_TRANSFERRED, MIGRATION_ITEM_FAILED,
+    MIGRATION_PUBLISHED, MIGRATION_FAILED, MIGRATION_CANCELLED,
+})
+
 # 会改变"仍可访问数据引用关系/保留代际"的事件。GC 计划水位只跟踪这些事件。
 _REFERENCE_EVENTS = frozenset({
     "preempt_issued",
@@ -85,6 +113,11 @@ _REFERENCE_EVENTS = frozenset({
     "restore_verified",
     GC_GENERATION_PIN,
     GC_GENERATION_UNPIN,
+    # 迁移任务获得/释放临时保留, 直接影响 GC 保留集合与计划水位
+    MIGRATION_CREATED,
+    MIGRATION_PUBLISHED,
+    MIGRATION_FAILED,
+    MIGRATION_CANCELLED,
 })
 
 
@@ -361,7 +394,8 @@ class JobManager:
     查询且可继续写入。
     """
 
-    def __init__(self, scheduler: Scheduler, data_dir: str | None = None):
+    def __init__(self, scheduler: Scheduler, data_dir: str | None = None,
+                 destinations: dict[str, ContentStore] | None = None):
         self.scheduler = scheduler
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
@@ -371,12 +405,23 @@ class JobManager:
         self._recording = False
 
         # 全局引用临界区锁: 计划生成/执行与所有可能新增引用的写操作互斥。
-        # 固定顺序为 reference -> GC state -> 各 Job.lock (按 job_id 排序)。
+        # 固定顺序为 reference -> GC state -> 各 Job.lock (按 job_id 排序);
+        # 迁移操作顺序为 reference -> migration -> Job.lock (与 GC 锁不嵌套)。
         self._reference_lock = threading.RLock()
         self._gc_lock = threading.RLock()
         self._pins: dict[str, set[int]] = {}
         self._gc_plans: dict[str, dict] = {}
         self._reference_seq = 0
+
+        # 迁移任务: 目标内容存储注册表 (配置, 不入事件日志, 重启需重新
+        # 注册) + 任务登记表 (事件溯源, 重启后可继续同一任务)。
+        # _migration_holds 是"活动任务临时保留"的去锁只读快照, 只在持有
+        # reference lock + migration lock 时整体替换, GC 在引用临界区内
+        # 直接读取, 因此保留集合与水位检查永远一致。
+        self._migration_lock = threading.RLock()
+        self._destinations: dict[str, ContentStore] = dict(destinations or {})
+        self._migrations: dict[str, dict] = {}
+        self._migration_holds: dict[str, list[str]] = {}
         self._replay()
         self._recording = True
 
@@ -1017,7 +1062,8 @@ class JobManager:
                 jobs, inventory=self.store.inventory(), pins=pins,
                 policy=policy,
                 min_retain_generation=min_retain_generation,
-                retain_generations=retain)
+                retain_generations=retain,
+                migration_holds=self._migration_hold_reasons())
             ts = now or time.time()
             plan = {
                 "plan_id": plan_id or new_plan_id(),
@@ -1077,6 +1123,7 @@ class JobManager:
             policy=plan["policy"],
             min_retain_generation=plan.get("min_retain_generation"),
             retain_generations=plan.get("retain_generations"),
+            migration_holds=self._migration_hold_reasons(),
         )
         if current["reference_fingerprint"] != plan["reference_fingerprint"]:
             return "reference_fingerprint_changed"
@@ -1085,7 +1132,7 @@ class JobManager:
             for ref in current.get("references", [])
             if str(ref["generation"]) in current.get(
                 "retained_generations", {}).get(ref["job_id"], {})
-        }
+        } | set(current.get("migration_holds", {}))
         planned = {c["blob"]: c for c in plan["candidates"]}
         physical = {digest for digest, _ in self.store.inventory()}
         extra = physical - current_retained - set(planned)
@@ -1232,6 +1279,368 @@ class JobManager:
                                   GC_RUNNING)
                 for c in p["candidates"] if c["status"] == "DELETED"
             }
+
+    # ========================================================= migration
+    # 迁移任务: 把一个 COMPLETE 检查点及其同代际输出迁移到另一套内容存储。
+    # 冻结清单 + 临时保留 -> 逐项断点续传 (按摘要复用) -> 全量校验后原子
+    # 发布可恢复代际; 失败/取消释放保留并尽力清理目标端新写入的 blob。
+    def register_destination(self, name: str, store: ContentStore) -> dict:
+        """注册一个迁移目标内容存储 (配置项, 不入事件日志, 重启需重新注册)。"""
+        if not isinstance(name, str) or not name:
+            raise ValidationError("destination name must be a non-empty string")
+        if not isinstance(store, ContentStore):
+            raise ValidationError("destination store must be a ContentStore")
+        with self._migration_lock:
+            self._destinations[name] = store
+        return {"destination": name, "registered": True}
+
+    def list_destinations(self) -> list[str]:
+        with self._migration_lock:
+            return sorted(self._destinations)
+
+    def _migration_hold_reasons(self) -> dict[str, list[str]]:
+        """活动迁移任务的临时保留视图 (blob -> 原因), 供 GC 快照使用。
+
+        只读 ``_migration_holds`` 快照; 快照仅在持有引用锁的迁移临界区内
+        被整体替换, 因此 GC 在引用临界区内读到的集合与水位检查一致。
+        """
+        return {
+            blob: [f"migration_hold:{tid}" for tid in task_ids]
+            for blob, task_ids in self._migration_holds.items()
+        }
+
+    def _refresh_migration_holds(self) -> None:
+        """重建临时保留快照。调用方持有 reference lock + migration lock。"""
+        holds: dict[str, list[str]] = {}
+        for task in self._migrations.values():
+            if task["state"] not in MIG_ACTIVE:
+                continue
+            for item in task["items"]:
+                holds.setdefault(item["blob"], []).append(task["task_id"])
+        self._migration_holds = {
+            blob: sorted(ids) for blob, ids in sorted(holds.items())
+        }
+
+    def create_migration(
+        self,
+        job_id: str,
+        *,
+        generation: int,
+        destination: str,
+        task_id: str | None = None,
+    ) -> dict:
+        """创建迁移任务: 冻结清单并登记临时保留。
+
+        幂等: 同一 (作业, 代际, 目标存储) 已存在活动任务, 或显式 task_id
+        已存在时, 直接返回原任务 (重复请求继续同一任务, 不新建)。
+        """
+        job = self.get(job_id)
+        with self._reference_lock, self._migration_lock, job.lock:
+            if destination not in self._destinations:
+                raise ValidationError(
+                    f"unknown destination {destination!r}; registered: "
+                    f"{sorted(self._destinations)}")
+            for task in self._migrations.values():
+                if (task["job_id"] == job_id
+                        and task["generation"] == generation
+                        and task["destination"] == destination
+                        and task["state"] in MIG_ACTIVE):
+                    return {**task_public(task), "idempotent_replay": True}
+            if task_id is not None and task_id in self._migrations:
+                task = self._migrations[task_id]
+                if (task["job_id"], task["generation"], task["destination"]) \
+                        != (job_id, generation, destination):
+                    raise Conflict(
+                        f"migration {task_id} is bound to a different "
+                        "job/generation/destination")
+                return {**task_public(task), "idempotent_replay": True}
+
+            cp = job.cpm.get(generation)
+            if cp.state != COMPLETE:
+                raise Conflict(
+                    f"checkpoint gen{generation} is {cp.state}; only "
+                    "COMPLETE checkpoints can be migrated")
+            items = build_manifest_items(job, generation)
+            digest = manifest_digest(job_id, generation, items)
+            ts = time.time()
+            task = {
+                "task_id": task_id or new_task_id(),
+                "job_id": job_id,
+                "generation": generation,
+                "destination": destination,
+                "state": MIG_PLANNED,
+                "created_ts": ts,
+                "started_ts": None,
+                "finished_ts": None,
+                "manifest_digest": digest,
+                "planned_items": len(items),
+                "planned_bytes": sum(it["size"] for it in items),
+                "transferred_items": 0,
+                "transferred_bytes": 0,
+                "reused_items": 0,
+                "reused_bytes": 0,
+                "failed_items": 0,
+                "state_reason": None,
+                "error": None,
+                "cancel_reason": None,
+                "cleanup": {},
+                "published": None,
+                "items": [new_item(it) for it in items],
+            }
+            self._migrations[task["task_id"]] = task
+            self._refresh_migration_holds()
+            self._record(job_id, MIGRATION_CREATED,
+                         {"task": task_public(task)}, ts=ts)
+            return {**task_public(task), "idempotent_replay": False}
+
+    def get_migration(self, task_id: str) -> dict:
+        with self._migration_lock:
+            task = self._migrations.get(task_id)
+            if task is None:
+                raise NotFound(f"unknown migration {task_id}")
+            return task_public(task)
+
+    def list_migrations(self, job_id: str | None = None) -> list[dict]:
+        with self._migration_lock:
+            tasks = [self._migrations[tid] for tid in sorted(self._migrations)]
+        if job_id is not None:
+            self.get(job_id)
+            tasks = [t for t in tasks if t["job_id"] == job_id]
+        return [task_public(t) for t in tasks]
+
+    def published_generations(self, job_id: str | None = None) -> list[dict]:
+        """已发布的可恢复代际记录 (仅 PUBLISHED 任务产生)。"""
+        with self._migration_lock:
+            records = [
+                dict(t["published"])
+                for t in self._migrations.values()
+                if t["state"] == MIG_PUBLISHED and t.get("published")
+                and (job_id is None or t["job_id"] == job_id)
+            ]
+        records.sort(key=lambda r: (r["job_id"], r["generation"]))
+        return records
+
+    def run_migration(self, task_id: str, *,
+                      max_items: int | None = None) -> dict:
+        """继续/执行迁移任务: 逐项传输, 全部到位后校验并原子发布。
+
+        每个 item 独立追加事件, 因此传输中断、重复调用或进程重启后用同一
+        task_id 继续即可; 已完成的项跳过, 目标端已有内容按复用记录。
+        ``max_items`` 限制单次调用处理的项数 (分块传输/测试中断点)。
+        """
+        if max_items is not None and max_items <= 0:
+            raise ValidationError("max_items must be positive")
+        with self._reference_lock, self._migration_lock:
+            task = self._migrations.get(task_id)
+            if task is None:
+                raise NotFound(f"unknown migration {task_id}")
+            if task["state"] == MIG_PUBLISHED:
+                return task_public(task)  # 已发布: 幂等返回
+            if task["state"] in (MIG_FAILED, MIG_CANCELLED):
+                raise Conflict(
+                    f"migration {task_id} is {task['state']} "
+                    f"({task.get('state_reason') or task.get('cancel_reason')}"
+                    "); create a new task to retry")
+            dest = self._destinations.get(task["destination"])
+            if dest is None:
+                raise NotFound(
+                    f"destination {task['destination']!r} is not registered")
+            job = self.get(task["job_id"])
+            if task["state"] == MIG_PLANNED:
+                task["state"] = MIG_TRANSFERRING
+                task["started_ts"] = time.time()
+
+            processed = 0
+            for item in task["items"]:
+                if item["status"] != MIG_ITEM_PENDING:
+                    continue
+                if max_items is not None and processed >= max_items:
+                    break
+                processed += 1
+                failure = self._transfer_item(task, item, dest)
+                if failure is not None:
+                    return self._fail_migration(
+                        task, failure["reason"], failure["error"], dest)
+
+            if any(it["status"] == MIG_ITEM_PENDING for it in task["items"]):
+                return task_public(task)  # 分块模式: 后续调用继续
+
+            # 发布临界区: 清单复核 + 目标端全量重校验, 全部通过才发布。
+            with job.lock:
+                current = build_manifest_items(job, task["generation"])
+                current_digest = manifest_digest(
+                    task["job_id"], task["generation"], current)
+                if current_digest != task["manifest_digest"]:
+                    return self._fail_migration(
+                        task, "manifest_changed",
+                        "manifest changed while migrating; refusing to "
+                        "publish a recoverable generation", dest)
+                bad = [it["blob"][:12] for it in task["items"]
+                       if not dest.verify(it["blob"])]
+                if bad:
+                    return self._fail_migration(
+                        task, "destination_verification_failed",
+                        f"destination verification failed for {bad}", dest)
+                ts = time.time()
+                record = {
+                    "job_id": task["job_id"],
+                    "generation": task["generation"],
+                    "destination": task["destination"],
+                    "task_id": task["task_id"],
+                    "manifest_digest": task["manifest_digest"],
+                    "items": [
+                        {"blob": it["blob"], "size": it["size"],
+                         "references": it["references"]}
+                        for it in task["items"]
+                    ],
+                    "planned_items": task["planned_items"],
+                    "transferred_items": task["transferred_items"],
+                    "reused_items": task["reused_items"],
+                    "total_bytes": task["planned_bytes"],
+                    "published_ts": ts,
+                }
+                task["state"] = MIG_PUBLISHED
+                task["finished_ts"] = ts
+                task["published"] = record
+                self._refresh_migration_holds()
+                self._record(task["job_id"], MIGRATION_PUBLISHED, {
+                    "task_id": task["task_id"],
+                    "generation": task["generation"],
+                    "destination": task["destination"],
+                    "record": record,
+                    "task": task_public(task),
+                }, ts=ts)
+                return task_public(task)
+
+    def cancel_migration(self, task_id: str, *,
+                         reason: str = "operator_cancel") -> dict:
+        """取消活动任务: 释放临时保留, 尽力清理目标端新写入的 blob。"""
+        with self._reference_lock, self._migration_lock:
+            task = self._migrations.get(task_id)
+            if task is None:
+                raise NotFound(f"unknown migration {task_id}")
+            if task["state"] in (MIG_FAILED, MIG_CANCELLED):
+                return task_public(task)  # 重复取消: 幂等
+            if task["state"] == MIG_PUBLISHED:
+                raise Conflict(
+                    f"migration {task_id} is already PUBLISHED; "
+                    "published generations are not rolled back by cancel")
+            dest = self._destinations.get(task["destination"])
+            ts = time.time()
+            task["state"] = MIG_CANCELLED
+            task["finished_ts"] = ts
+            task["cancel_reason"] = reason
+            task["cleanup"] = self._cleanup_destination(task, dest)
+            self._refresh_migration_holds()
+            self._record(task["job_id"], MIGRATION_CANCELLED, {
+                "task_id": task_id, "reason": reason,
+                "cleanup": task["cleanup"],
+                "task": task_public(task),
+            }, ts=ts)
+            return task_public(task)
+
+    # -------------------------------------------------- migration internals
+    def _transfer_item(self, task: dict, item: dict,
+                       dest: ContentStore) -> dict | None:
+        """传输一个清单项; 失败时返回 {reason, error} (任务随之失败)。"""
+        blob = item["blob"]
+        ts = time.time()
+        reason = error = None
+        try:
+            data = self.store.get(blob)
+            if sha256_hex(data) != blob:
+                reason, error = "source_digest_mismatch", (
+                    f"source blob {blob[:12]} failed digest check")
+        except NotFound:
+            reason, error = "source_missing", (
+                f"source blob {blob[:12]} is missing")
+        if reason is None:
+            try:
+                digest, _size, is_new = dest.put(data)
+            except OSError as exc:
+                reason, error = "destination_write_failed", str(exc)
+            else:
+                if digest != blob or not dest.verify(blob):
+                    reason, error = "destination_digest_mismatch", (
+                        f"destination blob {blob[:12]} failed digest check")
+        if reason is not None:
+            item["status"] = "FAILED"
+            item["error"] = error
+            item["ts"] = ts
+            task["failed_items"] += 1
+            self._record(task["job_id"], MIGRATION_ITEM_FAILED, {
+                "task_id": task["task_id"], "blob": blob,
+                "reason": reason, "error": error,
+            }, ts=ts)
+            return {"reason": reason, "error": error}
+
+        item["status"] = "REUSED" if not is_new else "TRANSFERRED"
+        item["ts"] = ts
+        if is_new:
+            task["transferred_items"] += 1
+            task["transferred_bytes"] += item["size"]
+        else:
+            task["reused_items"] += 1
+            task["reused_bytes"] += item["size"]
+        self._record(task["job_id"], MIGRATION_ITEM_TRANSFERRED, {
+            "task_id": task["task_id"], "blob": blob,
+            "size": item["size"], "status": item["status"],
+        }, ts=ts)
+        return None
+
+    def _fail_migration(self, task: dict, reason: str, error: str,
+                        dest: ContentStore | None) -> dict:
+        """任务进入 FAILED: 释放临时保留, 清理目标端, 不产生可恢复代际。"""
+        ts = time.time()
+        task["state"] = MIG_FAILED
+        task["finished_ts"] = ts
+        task["state_reason"] = reason
+        task["error"] = error
+        task["cleanup"] = self._cleanup_destination(task, dest)
+        self._refresh_migration_holds()
+        self._record(task["job_id"], MIGRATION_FAILED, {
+            "task_id": task["task_id"], "reason": reason, "error": error,
+            "cleanup": task["cleanup"],
+            "task": task_public(task),
+        }, ts=ts)
+        return task_public(task)
+
+    def _cleanup_destination(self, task: dict,
+                             dest: ContentStore | None) -> dict:
+        """尽力清理目标端由本任务新写入的 blob。
+
+        只删除状态为 TRANSFERRED (本任务写入) 的项; REUSED 项原本就存在,
+        绝不删除。被其他活动任务或已发布代际引用的 blob 保留。目标存储
+        未注册 (重启后未配置) 时跳过清理, 不影响保留的释放。
+        """
+        result = {"deleted_items": 0, "deleted_bytes": 0,
+                  "kept_items": 0, "skipped": dest is None}
+        if dest is None:
+            return result
+        protected: set[str] = set()
+        for other in self._migrations.values():
+            if other["task_id"] == task["task_id"]:
+                continue
+            if other["state"] in MIG_ACTIVE or other["state"] == MIG_PUBLISHED:
+                protected.update(it["blob"] for it in other["items"])
+        for item in task["items"]:
+            if item["status"] != "TRANSFERRED":
+                continue
+            blob = item["blob"]
+            if blob in protected:
+                result["kept_items"] += 1
+                continue
+            try:
+                existed, freed = dest.delete(blob)
+            except OSError:
+                result["kept_items"] += 1
+                continue
+            if existed:
+                result["deleted_items"] += 1
+                result["deleted_bytes"] += freed
+            else:
+                result["kept_items"] += 1
+        return result
 
     # ------------------------------------------------------------- restore
     def restore(
@@ -1439,6 +1848,8 @@ class JobManager:
         # 固定加锁顺序: GC state -> Job.lock; 先在 Job 锁外读取 GC 视图。
         gc_plans = self.list_gc_plans(job_id)
         collected = self._collected_blob_plans()
+        migrations = self.list_migrations(job_id)
+        published = self.published_generations(job_id)
         with job.lock:
             cps = [c.to_dict() for c in job.cpm.list_all()]
             shard_index: dict[str, dict] = {}
@@ -1473,6 +1884,8 @@ class JobManager:
                 "security_events": list(
                     reversed(self.security_events(job_id))),
                 "gc_plans": gc_plans,
+                "migrations": migrations,
+                "published_migrations": published,
                 "server_ts": time.time(),
             }
         return result
@@ -1495,6 +1908,13 @@ class JobManager:
         if etype in (GC_PLAN_CREATED, GC_RUN_STARTED, GC_BLOB_DELETED,
                      GC_RUN_FINISHED, GC_PLAN_STALE):
             self._apply_gc_event(etype, detail, ts)
+            return
+
+        if etype in _MIGRATION_EVENTS:
+            self._apply_migration_event(etype, detail, ts)
+            mig_job = self._jobs.get(job_id)
+            if mig_job is not None:
+                self._audit_only(mig_job, etype, ts, detail)
             return
 
         if etype == "job_created":
@@ -1689,6 +2109,68 @@ class JobManager:
             plan["state"] = GC_STALE
             plan["finished_ts"] = ts
             plan["stale_reason"] = detail.get("reason")
+
+    def _apply_migration_event(self, etype: str, detail: dict,
+                               ts: float) -> None:
+        """重放迁移任务事件, 恢复可继续执行的任务状态。"""
+        if etype == MIGRATION_CREATED:
+            task = dict(detail["task"])
+            task["items"] = [dict(it, references=[dict(r) for r in
+                                                  it["references"]])
+                             for it in task.get("items", [])]
+            self._migrations[task["task_id"]] = task
+            self._refresh_migration_holds()
+            return
+
+        task = self._migrations.get(detail["task_id"])
+        if task is None:
+            return
+        if etype == MIGRATION_ITEM_TRANSFERRED:
+            item = next((it for it in task["items"]
+                         if it["blob"] == detail["blob"]), None)
+            if item is None or item["status"] != MIG_ITEM_PENDING:
+                return
+            item["status"] = detail["status"]
+            item["ts"] = ts
+            if detail["status"] == "TRANSFERRED":
+                task["transferred_items"] += 1
+                task["transferred_bytes"] += int(detail.get("size") or 0)
+            else:
+                task["reused_items"] += 1
+                task["reused_bytes"] += int(detail.get("size") or 0)
+            if task["state"] == MIG_PLANNED:
+                task["state"] = MIG_TRANSFERRING
+                task["started_ts"] = ts
+        elif etype == MIGRATION_ITEM_FAILED:
+            item = next((it for it in task["items"]
+                         if it["blob"] == detail["blob"]), None)
+            if item is not None and item["status"] == MIG_ITEM_PENDING:
+                item["status"] = "FAILED"
+                item["error"] = detail.get("error")
+                item["ts"] = ts
+                task["failed_items"] += 1
+        elif etype in (MIGRATION_PUBLISHED, MIGRATION_FAILED,
+                       MIGRATION_CANCELLED):
+            # 事件内含权威任务视图 (计数/清理/发布记录以落盘为准)
+            saved = detail.get("task")
+            if saved:
+                task.update(saved)
+                task["items"] = [dict(it, references=[dict(r) for r in
+                                                      it["references"]])
+                                 for it in saved.get("items", [])]
+            task["finished_ts"] = ts
+            if etype == MIGRATION_PUBLISHED:
+                task["state"] = MIG_PUBLISHED
+                task["published"] = detail.get("record")
+            elif etype == MIGRATION_FAILED:
+                task["state"] = MIG_FAILED
+                task["state_reason"] = detail.get("reason")
+                task["error"] = detail.get("error")
+            else:
+                task["state"] = MIG_CANCELLED
+                task["cancel_reason"] = detail.get("reason")
+            task["cleanup"] = detail.get("cleanup") or {}
+            self._refresh_migration_holds()
 
     @staticmethod
     def _audit_only(job: Job, etype: str, ts: float, detail: dict) -> None:

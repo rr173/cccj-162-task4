@@ -34,6 +34,11 @@ _STATE_COLORS = {
     "DELETED": "#0a7d2c",
     "SKIPPED": "#666",
     "FAILED": "#b00020",
+    "TRANSFERRING": "#b26a00",
+    "PUBLISHED": "#0a7d2c",
+    "CANCELLED": "#666",
+    "TRANSFERRED": "#0a7d2c",
+    "REUSED": "#1a4fb3",
 }
 
 
@@ -92,6 +97,92 @@ def render_gc_section(gc_plans: list[dict], job_id: str) -> str:
     <a href="/api/jobs/%s/gc/pins">本作业代际锁</a></small></p>
     %s
     """ % (_h(job_id), "".join(blocks))
+
+
+def render_migration_section(migrations: list[dict],
+                             published: list[dict]) -> str:
+    """迁移任务进度: 计划总量/已传输/复用/失败/最终状态与原因。"""
+    if not migrations:
+        return """
+        <h2>检查点迁移任务</h2>
+        <p><small>暂无迁移任务 · <code>POST /api/migrations</code> 创建
+        (job_id, generation, destination)</small></p>
+        """
+    blocks = []
+    for t in migrations[:10]:
+        item_rows = "".join(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td>"
+            "<td>{}</td><td><small>{}</small></td></tr>".format(
+                _h(it["blob"][:16]), it["size"],
+                _h(", ".join(r["kind"] + ":" + r["ref_id"]
+                             for r in it["references"])),
+                _badge(it["status"]),
+                _h(it.get("error") or ""))
+            for it in t.get("items", [])[:50]
+        ) or '<tr><td colspan="5">无清单项</td></tr>'
+        reason = (t.get("error") or t.get("cancel_reason")
+                  or t.get("state_reason") or "")
+        cleanup = t.get("cleanup") or {}
+        cleanup_html = ""
+        if cleanup and t["state"] in ("FAILED", "CANCELLED"):
+            cleanup_html = (
+                f" · 目标端清理: 删除 {cleanup.get('deleted_items', 0)} 项/"
+                f"{cleanup.get('deleted_bytes', 0)} 字节, "
+                f"保留 {cleanup.get('kept_items', 0)} 项"
+                + (" (目标存储未注册, 已跳过)" if cleanup.get("skipped")
+                   else ""))
+        published_html = ""
+        if t.get("published"):
+            rec = t["published"]
+            published_html = (
+                f"<p><small>✅ 已发布可恢复代际 gen{rec['generation']} → "
+                f"<code>{_h(rec['destination'])}</code> · 清单摘要 "
+                f"<code>{_h(rec['manifest_digest'][:16])}</code> · "
+                f"发布于 {_ts(rec['published_ts'])}</small></p>")
+        blocks.append(f"""
+        <h3>任务 <code>{_h(t['task_id'])}</code> {_badge(t['state'])}</h3>
+        <p><small>代际 gen{t['generation']} → 目标存储
+        <code>{_h(t['destination'])}</code> · 清单摘要
+        <code>{_h(t['manifest_digest'][:16])}</code> · 创建于
+        {_ts(t.get('created_ts'))} · 结束于 {_ts(t.get('finished_ts'))}
+        {cleanup_html}</small></p>
+        <table border="1" cellpadding="6">
+          <tr><th>计划总量</th><th>已传输项</th><th>复用项</th>
+          <th>失败项</th><th>待传输</th><th>最终状态/原因</th></tr>
+          <tr><td>{t['planned_items']} 项 / {t['planned_bytes']} 字节</td>
+          <td>{t['transferred_items']} 项 / {t['transferred_bytes']} 字节</td>
+          <td>{t['reused_items']} 项 / {t['reused_bytes']} 字节</td>
+          <td>{t['failed_items']}</td>
+          <td>{t['pending_items']}</td>
+          <td>{_badge(t['state'])} {_h(reason)}</td></tr>
+        </table>
+        {published_html}
+        <details><summary>清单项明细 (前 50 项)</summary>
+        <table border="1" cellpadding="6"><tr><th>blob</th><th>大小</th>
+        <th>引用</th><th>状态</th><th>错误</th></tr>
+        {item_rows}</table></details>""")
+    pub_rows = "".join(
+        f"<tr><td>gen{r['generation']}</td>"
+        f"<td><code>{_h(r['destination'])}</code></td>"
+        f"<td><code>{_h(r['manifest_digest'][:16])}</code></td>"
+        f"<td>{r['planned_items']}</td>"
+        f"<td>{r['transferred_items']}</td><td>{r['reused_items']}</td>"
+        f"<td>{_ts(r['published_ts'])}</td></tr>"
+        for r in published
+    )
+    published_table = ""
+    if pub_rows:
+        published_table = f"""
+        <h3>已发布可恢复代际 (目标存储可用)</h3>
+        <table border="1" cellpadding="6"><tr><th>代际</th><th>目标存储</th>
+        <th>清单摘要</th><th>总项</th><th>传输</th><th>复用</th>
+        <th>发布时间</th></tr>{pub_rows}</table>"""
+    return """
+    <h2>检查点迁移任务 (冻结清单 → 断点续传 → 校验后原子发布)</h2>
+    <p><small><a href="/api/migrations">全部迁移任务 JSON</a></small></p>
+    %s
+    %s
+    """ % ("".join(blocks), published_table)
 
 
 def render_progress_page(data: dict) -> str:
@@ -213,6 +304,8 @@ def render_progress_page(data: dict) -> str:
 <h2>检查点分片矩阵</h2>
 {''.join(matrices) or '<p>尚无检查点</p>'}
 {render_gc_section(data.get('gc_plans') or [], job['job_id'])}
+{render_migration_section(data.get('migrations') or [],
+                          data.get('published_migrations') or [])}
 <h2>节点</h2>
 <table border="1" cellpadding="6"><tr><th>节点</th><th>状态</th>
 <th>最近心跳</th><th>ranks</th></tr>{node_rows}</table>
